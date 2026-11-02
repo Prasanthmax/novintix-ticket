@@ -1,447 +1,374 @@
-# HAESS Support Platform
+# Cross-Department Support Desk
 
-**High-Assurance Enterprise Support System**  
-*A deterministic, multi-tenant ticketing engine with cryptographically bound cross-department handoffs, department-isolated workspaces, and a guardrailed LangGraph assistant.*
+> A ticketing system where several departments can work on one request together, without seeing each other's private discussions.
 
----
-
-## 1. Executive Summary
-
-In complex enterprise environments (HRMS, Finance, CRM, Engineering, Recruitment), employee support issues frequently originate in one functional silo but require investigation from another. For instance, an employee raising a payroll deduction inquiry in HRMS may require confidential ledger verification by Finance and database diagnostics by IT.
-
-Traditional service desks suffer from a fundamental security conflict:
-1. **Over-privilege & Data Leakage**: Requesters or cross-department engineers gain visibility into sensitive internal discussions, compensation figures, disciplinary remarks, or regulatory PII.
-2. **Context Loss & Uncontrolled Duplication**: When tickets are manually duplicated or forwarded across teams, sensitive data is scattered across uncoordinated threads without provenance, expiration, or revocation controls.
-
-**HAESS** resolves this architectural trade-off via **Strict Compartmentalization and Deterministic Boundaries**:
-- **Department-Private Workspaces**: Each department works inside isolated task queues and message logs. Requesters see only sanitized, human-curated status updates.
-- **Controlled Cross-Department Handoffs**: Work crosses department boundaries through an audited, approval-gated cryptographic contract (`shared_contexts`) with strictly whitelisted schemas, regex validation, and SHA-256 payload integrity hashing.
-- **Zero Probabilistic Access Control**: All authorization, audience boundary checks, tier classifications, and hash verifications are strictly deterministic Python code. AI / LLM components never grant permissions, mutate data, execute tools, or lower confidentiality tiers.
-- **Closed-Set AI Assistant**: An optional LangGraph-powered co-pilot assists engineers by suggesting handoff parameters. T2/T3 tickets and sensitive context chunks are deterministically blocked from ever reaching the model.
+Built with Python, FastAPI and SQLite. Free and open-source tools only. Runs on a laptop with no cloud services.
 
 ---
 
-## 2. High-Level System Architecture
+## What problem does it solve?
+
+In most companies, one problem touches several teams. Example: an employee reports a wrong salary deduction in the HR system. HR needs Finance to check a payment, and maybe IT to look at an error. Two things usually go wrong:
+
+1. **Too much is visible.** Everyone on the ticket can read everything, including salary figures, complaints or personal details that other teams do not need.
+2. **Information gets copied around.** Someone pastes details into another team's thread or email. Nobody controls who sees it, for how long, or whether it was changed.
+
+This project fixes both. Every department works in its own private space, and information moves between departments only through one controlled step called a **handoff**.
+
+## The idea in one minute
+
+- One request is one **parent ticket**. Each department that works on it gets its own **task**.
+- A task's messages are private to that department. Everyone else gets a "not found" response.
+- To get help from another department, an engineer fills in a **handoff form**. The form only accepts a fixed list of fields in a fixed format (for example a job requisition number, not free text).
+- Sensitive handoffs need a manager's approval. The approved content gets a fingerprint (a hash), so any later change is detected.
+- Each ticket has a **confidentiality level** (T1, T2 or T3) that decides which handoffs are allowed.
+- An optional **AI helper** can suggest a handoff form. It can only pick from fixed lists, never sees sensitive tickets, and never makes decisions. The system works fully without it.
+- Every action, allowed or denied, is written to an **audit log**.
+
+One rule runs through everything: **permission checks are normal code, not AI.** The AI can never grant access or lower a confidentiality level.
+
+## Who uses it
+
+| Role | What they can do |
+|---|---|
+| Requester | Create tickets. See the status and public updates of their own tickets, nothing else. |
+| Engineer | Work on tasks in their department, write private messages, submit handoffs, post public updates, raise a ticket's confidentiality level. |
+| Lead | Next stop when a ticket is overdue. Can close tickets they own. |
+| Manager | Approve, reject or revoke their department's handoffs. Lower confidentiality levels. Run the overdue-ticket check by hand. |
+
+---
+
+## How it works
+
+The diagram shows the path of a ticket from intake to close.
 
 ```mermaid
 flowchart TD
-    subgraph Ingestion["1. Ticket Ingestion & Routing"]
-        A[Enterprise App / Requester<br/>HRMS, CRM, FIN, TAG] -->|POST /tickets (E1)| B[Deterministic Router & Assignment Engine]
-        B -->|Matches Routing Table| C[Department Queue<br/>HR, FIN, IT, CRM, TAG]
-        B -->|Unmatched Category| D[TRIAGE Queue]
-        B -->|Least-Loaded Engineer| E[Assignee Allocated]
-        B -->|No Eligible Engineer| F[Queue-Owned<br/>AWAITING_ASSIGNMENT]
+    subgraph Intake["1. Intake and routing"]
+        A["Requester, via an app<br/>HRMS, CRM, Finance"] -->|"creates ticket"| B["Router"]
+        B -->|"category known"| C["Department queue"]
+        B -->|"category unknown"| D["TRIAGE queue"]
+        C --> E["Engineer assigned<br/>least busy first"]
+        D --> E
+        C -->|"nobody free"| F["Stays in queue<br/>AWAITING_ASSIGNMENT"]
     end
 
-    subgraph Workspaces["2. Department Isolation (Tiers T1, T2, T3)"]
-        C --> G[Parent Ticket]
-        G --> H[Department-Private Task (E5)]
-        H --> I[(Private Messages E6/E7)]
-        G --> J[(Public Updates E2/E3<br/>Requester-Visible)]
+    subgraph Work["2. Private workspaces"]
+        E --> G["Parent ticket"]
+        G --> H["Private task and messages"]
+        G --> J["Public updates<br/>the requester can see"]
     end
 
-    subgraph Handoffs["3. Cryptographic Cross-Department Handoff"]
-        H -->|Draft Suggestion E8| K[LangGraph Closed-Set Agent<br/>TF-IDF & Regex Filtered]
-        H -->|Engineer Submit E9| L[Handoff Contract<br/>Whitelist Regex Validation]
-        L --> M[SHA-256 Payload Hash Computed]
-        M -->|Approval Required| N[Source Dept Manager Approval (E10-E12)]
-        N -->|Approved| O[shared_contexts Record<br/>Read-by-Reference]
-        O -->|Target Dept GET /handoffs/{id} (E13)| P[Target Child Task Spawned<br/>Strict Audience & Hash Re-Check]
+    subgraph Handoff["3. Handoff to another department"]
+        H --> K["AI draft, optional"]
+        K --> L["Engineer fills the handoff form"]
+        H --> L
+        L --> M["Fields checked, hash computed"]
+        M --> N["Manager approves, if required"]
+        N --> O["Other department reads the fields<br/>by reference"]
+        L --> P["Child task created<br/>in the other department"]
     end
 
-    subgraph Governance["4. Observability & Lifecycle"]
-        Q[SLA Sweeper & Escalation Loop E15] -.->|Every 60s| G
-        R[Append-Only Audit Ledger] <--- Ingestion
-        R <--- Workspaces
-        R <--- Handoffs
+    subgraph Track["4. Follow-up"]
+        Q["Overdue check every 60 seconds"] -.-> G
+        R["Audit log"]
     end
+
+    Intake --> R
+    Work --> R
+    Handoff --> R
 ```
+
+**Step by step**
+
+1. **Intake.** An app calls `POST /tickets`. The router matches the app and category to a department. An unknown category goes to the TRIAGE queue, so nothing is ever unrouted. The engineer with the fewest open items is assigned. If nobody is free, the queue owns the ticket (status `AWAITING_ASSIGNMENT`), so it never sits without an owner.
+2. **Work.** The engineer works in the department's private task. Other departments and the requester cannot read it. The requester only sees public updates, which a human writes.
+3. **Handoff.** If another department is needed, the engineer submits a handoff (see below). This creates a child task in that department.
+4. **Follow-up.** Every 60 seconds a check looks for overdue tickets and escalates them: assignee, then lead, then manager, then the TRIAGE coordinator.
+5. **Close.** The parent ticket can only be closed when every child task is done.
 
 ---
 
-## 3. Core Architectural Principles & Invariants
+## Confidentiality levels
 
-| Principle | Technical Enforcement |
-|---|---|
-| **Zero Cost & Open-Source** | Built on Python 3.11+, FastAPI, SQLite (WAL mode), SQLAlchemy 2.0, Pydantic v2, scikit-learn, and LangGraph. Zero proprietary or cloud vendor lock-in. |
-| **Deterministic Security Barrier** | Authentication, authorization, audience validation, tier enforcement, and cryptographic payload integrity are 100% deterministic code. |
-| **Defensive ID Enumeration Prevention** | Any unauthorized attempt to view tasks, private messages, or handoffs returns `404 Not Found` (never `403 Forbidden`), preventing resource ID probing. |
-| **Strict Read-by-Reference** | Shared payload fields are never duplicated into target task message logs. The target department reads data dynamically via `GET /handoffs/{id}`, which re-evaluates expiry, revocation, audience, and SHA-256 payload integrity on every access. |
-| **Parent-Child Completion Locking** | A parent ticket cannot be closed (`POST /tickets/{id}/close`) while any downstream child task remains in an unfinished state. |
-| **Append-Only Auditing** | Every permitted or denied API call writes an immutable record to `audit_log`. The database layer permits no runtime `UPDATE` or `DELETE` on audit tables. |
-
----
-
-## 4. Confidentiality & Security Model
-
-HAESS implements a 3-tier hierarchical confidentiality model. Tiers can be escalated automatically or manually, but can only be downgraded under strict manager-level audited authorization.
-
-```
-       [T1: Standard] ───────────────► Default operational tier
-             │
-             ▼ (Requester flag, PII regex hit, TF-IDF sensitivity >= VERY_SENS_T, or engineer toggle)
-       [T2: Confidential] ───────────► Audience-restricted handoffs, mandatory approval, AI disabled
-             │
-             ▼ (RESTRICTED_CATEGORIES: GRIEVANCE, HARASSMENT, LEGAL, SECURITY_INCIDENT)
-       [T3: Restricted] ─────────────► Zero handoffs permitted; manager-only manual handling, AI disabled
-```
-
-### Confidentiality Tiers Matrix
-
-| Tier | Designation | Trigger Conditions | AI Handoff Suggestion (`E8`) | Permitted Handoff Targets | Approval Requirement |
+| Level | Meaning | Set when | AI helper | Handoffs allowed | Approval |
 |---|---|---|---|---|---|
-| **T1** | **Standard** | Default for all standard business operations. | **Allowed** (after TF-IDF & PII scrubbing) | Any whitelisted department in `REQUEST_TYPES` | Per `REQUEST_TYPES` schema configuration |
-| **T2** | **Confidential** | Requester flag at creation, regex PII hit, TF-IDF score $\ge VERY\_SENS\_T$, or engineer elevation. | **Blocked** (Zero LLM calls made; instant fallback) | Restricted strictly to `audience_depts` whitelist | **Mandatory** for all handoffs regardless of type |
-| **T3** | **Restricted** | Forced for `RESTRICTED_CATEGORIES` (`GRIEVANCE`, `HARASSMENT`, `LEGAL`, `SECURITY_INCIDENT`). | **Blocked** (Zero LLM calls made; instant fallback) | **Forbidden** (Cross-department handoffs completely blocked) | N/A (Handled solely by Department Manager) |
+| **T1** Standard | Normal ticket | Default | Allowed | To any department the request type allows | Depends on the request type |
+| **T2** Confidential | Sensitive | The requester marks it confidential, sensitive text is found, or an engineer raises it | Never | Only to departments in the ticket's **audience** | Always |
+| **T3** Restricted | Highest | Category is grievance, harassment, legal or security incident | Never | None. A manager handles it manually | Not applicable |
 
-### Tier Elevation and Lowering Rules
-- **Elevation**: Any assigned engineer or department manager may elevate a ticket's tier (`T1 -> T2 -> T3`).
-- **Lowering**: Only a department **manager** may lower a ticket's tier (`T3 -> T2 -> T1`). Attempts by engineers return `404`/`403`. Every tier downgrade creates an audited entry with rationale.
+The **audience** is a list of departments allowed to be involved, chosen when the ticket is created. For example, a confidential hiring ticket can list HR and TAG only. A handoff to any other department is blocked.
 
----
-
-## 5. Dual-Stage Safety & Context Scrubbing
-
-Before any ticket text reaches the optional LangGraph agent, it must pass a dual-stage, fail-closed sanitization pipeline:
+Levels can be raised by an engineer or manager. Only a manager can lower them, and every change is logged.
 
 ```mermaid
 flowchart LR
-    A[Task Message Chunks<br/>Max 20 Messages / 4000 Chars] --> B{Stage 1: Deterministic<br/>Regex Detectors}
-    B -->|Hit: PAN, Aadhaar, INR, Bank, Phone, Email| C[Drop Chunk<br/>Elevate Ticket to T2]
-    B -->|Clean| D{Stage 2: TF-IDF<br/>Cosine Sensitivity Filter}
-    D -->|Cosine Score >= VERY_SENS_T| C
-    D -->|Cosine Score >= SENS_T| E[Exclude Chunk from Context]
-    D -->|Relevance < REL_T| E
-    D -->|Clean & Relevant| F[Permitted Chunk<br/>Passed to LangGraph Context]
+    N["New ticket"] -->|"normal category"| T1["T1 Standard"]
+    N -->|"restricted category"| T3["T3 Restricted"]
+    T1 -->|"flagged or sensitive text found"| T2["T2 Confidential"]
+    T2 -->|"raised by engineer or manager"| T3
+    T3 -.->|"lowered by manager only"| T2
+    T2 -.->|"lowered by manager only"| T1
 ```
 
-1. **Stage 1: Deterministic Regex Detectors (`safety/detectors.py`)**:
-   - Indian Rupee amounts (`₹`, `INR`, `Rs.`)
-   - Permanent Account Number (PAN) patterns (`[A-Z]{5}[0-9]{4}[A-Z]{1}`)
-   - Aadhaar 12-digit identification patterns
-   - Bank account number runs
-   - Corporate email addresses and telephone numbers
-   *Action*: A match immediately drops the chunk and elevates the ticket to **T2 Confidential**. If detected in an engineer handoff `note`, the request is rejected with `422 Unprocessable Entity` and the ticket is elevated.
-
-2. **Stage 2: TF-IDF Cosine Similarity Filter (`safety/sensitivity.py`)**:
-   - Chunks task dialogue into sentence units.
-   - Evaluates vector cosine similarity against domain seed phrases (`safety/seeds.py`: salary, grievance, disciplinary, medical, legal, banking).
-   - Thresholds: `SENS_T = 0.30`, `REL_T = 0.20`, `VERY_SENS_T = 0.50`.
-   - Tuned to achieve $\ge 0.95$ recall on sensitive chunks against benchmark dataset `tests/data/filter_eval.json`.
+**Why "not found" instead of "forbidden"?** If someone asks for a task they may not see, the API answers `404 Not Found`, the same answer as for a task that does not exist. This stops people from guessing IDs to find out what exists.
 
 ---
 
-## 6. Cryptographic Handoff Protocol (`shared_contexts`)
+## Handoffs: what is allowed to cross between departments
 
-Cross-department collaboration is governed by the `shared_contexts` state machine:
+A handoff is the only way data leaves a department. It has:
+
+- a **request type** (what kind of help is needed),
+- a few **fields**, each with a strict format,
+- a **reason code** from a fixed list,
+- an optional **note** of up to 200 characters, typed by the engineer and scanned for sensitive patterns.
+
+Anything that does not match the allowed fields and formats is rejected with `422`.
+
+| Request type | Goes to | Allowed fields (example values) | Approval | Expires after |
+|---|---|---|---|---|
+| `payroll_verification` | FIN | `deduction_ref` (DED-001234), `payroll_period` (2026-10), `txn_status` (PENDING, POSTED, FAILED or REVERSED) | Yes | 48 hours |
+| `technical_diagnosis` | IT | `service_id` (SVC-1024), `error_code` (ERR-500), `time_window` (start/end timestamps) | No | 24 hours |
+| `hiring_status_check` | TAG | `job_req_id` (REQ-40120), `candidate_ref` (CAND-009812), `stage` (APPLIED, SCREENING, OFFER or JOINED) | Yes | 48 hours |
+
+### Life of a handoff
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PENDING: POST /tasks/{id}/handoff (E9)
-    [*] --> APPROVED: E9 (if approval_required == False)
-    PENDING --> APPROVED: POST /handoffs/{id}/approve (E10) [Manager Only]
-    PENDING --> REJECTED: POST /handoffs/{id}/reject (E11) [Manager Only]
-    APPROVED --> REVOKED: POST /handoffs/{id}/revoke (E12) [Manager Only]
-    APPROVED --> EXPIRED: Exceeded ttl_hours (24h/48h)
-    
-    state APPROVED {
-        [*] --> ReadAllowed: GET /handoffs/{id} (E13)
-        ReadAllowed --> VerifyAudience: Check target in audience_depts
-        VerifyAudience --> VerifyHash: Recompute SHA-256 payload_hash
-        VerifyHash --> DeliverPayload: Fields decrypted/read by reference
-    }
+    [*] --> PENDING: Engineer submits, approval needed
+    [*] --> APPROVED: Engineer submits, no approval needed
+    PENDING --> APPROVED: Manager approves
+    PENDING --> REJECTED: Manager rejects
+    APPROVED --> REVOKED: Manager revokes
+    APPROVED --> EXPIRED: Time limit passes
+    REJECTED --> [*]
+    REVOKED --> [*]
+    EXPIRED --> [*]
 ```
 
-### Whitelisted Handoff Schemas (`REQUEST_TYPES`)
+Expiry is not stored as a status. It is checked every time the handoff is read.
 
-Handoff payloads reject arbitrary free-text fields. Only pre-registered, strictly validated schemas are accepted:
+### How the other department reads it
 
-| Request Type | Target Dept | Permitted Whitelist Fields & Formats | Reason Codes | Approval Required | TTL |
-|---|---|---|---|---|---|
-| `payroll_verification` | `FIN` | `deduction_ref`: `^DED-\d{6}$`<br/>`payroll_period`: `^\d{4}-(0[1-9]\|1[0-2])$`<br/>`txn_status`: `[PENDING, POSTED, FAILED, REVERSED]` | `VERIFY_DEDUCTION`, `VERIFY_TXN` | **Yes** | 48 hrs |
-| `technical_diagnosis` | `IT` | `service_id`: `^SVC-\d{4}$`<br/>`error_code`: `^ERR-\d{3,5}$`<br/>`time_window`: ISO-8601 interval format | `DIAGNOSE_ERROR` | **No** | 24 hrs |
-| `hiring_status_check` | `TAG` | `job_req_id`: `^REQ-\d{5}$`<br/>`candidate_ref`: `^CAND-\d{6}$`<br/>`stage`: `[APPLIED, SCREENING, OFFER, JOINED]` | `VERIFY_STATUS`, `VERIFY_OFFER`, `DUPLICATE_CHECK` | **Yes** | 48 hrs |
+The other department does not get a copy. It reads the handoff **by reference** with `GET /handoffs/{id}`, and the system re-checks everything on every read:
 
-### Payload Hash & Tamper-Evidence
-When a handoff is created, the system calculates a canonical SHA-256 hash:
-$$\text{payload\_hash} = \text{SHA256}(\text{sort}(\text{request\_type}, \text{fields\_json}, \text{reason\_code}, \text{note}, \text{target\_dept\_code}))$$
-On every read via `GET /handoffs/{id}`, the hash is recalculated over the stored record. If any field has been tampered with or modified out-of-band in the database, the read fails with a security violation.
+1. Is it approved?
+2. Has it expired or been revoked?
+3. Is the reading department allowed (in the ticket's audience)?
+4. Does the fingerprint still match?
+
+### The fingerprint (hash)
+
+When a handoff is created, the system computes a SHA-256 hash over the request type, fields, reason code, note and target department. On every read it computes the hash again. If someone edited the stored data in the meantime, the hashes differ and the read is refused.
+
+```text
+payload_hash = SHA-256( request_type + fields + reason_code + note + target_department )
+```
+
+This detects changes. It does **not** encrypt the data.
 
 ---
 
-## 7. LangGraph Guardrailed Agent Architecture
+## The AI helper (optional)
 
-The LangGraph co-pilot (`app/agent/graph.py`) assists engineers in drafting handoff payloads without exposing system state or allowing autonomous agency.
+When an engineer asks for help (`POST /tasks/{id}/handoff/suggest`), a small LangGraph workflow suggests which request type and reason code fit the task. The engineer reviews and edits the draft before submitting it.
 
 ```mermaid
 flowchart TD
-    A([Start: POST /tasks/{id}/handoff/suggest]) --> B[load_context: Fetch Last 20 Msgs]
-    B --> C{filter: Regex & TF-IDF Gate}
-    C -->|T2/T3 or Sensitive Chunk| D[Status: Escalate / Fallback<br/>0 LLM Calls Made]
-    C -->|Sanitized Context| E[propose: Invoke LLM<br/>Temperature 0.0, Closed-Set Prompt]
-    E --> F{validate: validate_handoff_payload}
-    F -->|Valid Schema| G([Status: OK<br/>Return Draft to Engineer])
-    F -->|Invalid Schema| H{Retry Count < 1?}
-    H -->|Yes| E
-    H -->|No| I([Status: Fallback<br/>Return Empty Draft])
-    D --> J([End: E8 Returns 200 OK])
-    G --> J
-    I --> J
+    A(["Engineer asks for a draft"]) --> B["Load the last 20 messages of this task"]
+    B --> C{"Safety filter"}
+    C -->|"T2 or T3 ticket, or sensitive text"| D["Stop, no AI call<br/>return fallback"]
+    C -->|"clean text"| E["Model picks request type<br/>and reason code"]
+    E --> F{"Valid answer?"}
+    F -->|"yes"| G(["Return draft to the engineer"])
+    F -->|"no, first try"| E
+    F -->|"no, second try"| H(["Return fallback, nothing suggested"])
+    D --> I(["Request ends with HTTP 200"])
+    G --> I
+    H --> I
 ```
 
-### Agent Guardrail Invariants
-1. **Zero Autonomy**: The agent never creates tasks, approves handoffs, or updates tickets. It returns an ephemeral JSON draft for engineer review.
-2. **Zero Tool Access**: The model has no tool execution capabilities, no file system access, and no database credentials.
-3. **Closed-Set Classification**: The LLM is restricted to classifying an enum of `request_type` and `reason_code`.
-4. **Deterministic Field Extraction**: The LLM **never** generates field values. Field values (e.g. `SVC-1024`, `DED-001234`) are extracted solely via deterministic regex from allowed message chunks.
-5. **Prompt Injection Resilience**: System prompt encapsulates ticket context strictly inside `<context>DATA</context>` boundaries with explicit instructions that context text represents passive data, never operational instructions.
-6. **Hard Fault Boundaries**: Max 2 LLM invocations, strict 20-second timeout, and guaranteed fallback to HTTP 200 with `status: "fallback"` on any failure or provider error.
+**What it does:** picks a request type and a reason code from fixed lists. Field values such as `SVC-1024` are pulled out of the messages by plain pattern matching, not written by the model.
+
+**What it cannot do:** create tasks, approve handoffs, change confidentiality levels, read other tasks, run tools, or see T2 and T3 tickets.
+
+**Limits:** two attempts at most, 20 seconds per call. Any failure returns a safe fallback with HTTP 200, never an error. Ticket text is passed to the model as data, with instructions to ignore any commands inside it.
+
+**Choosing a model:** set `LLM_PROVIDER` to `none` (default, no AI), `ollama` (local model) or `gemini` (free key). If you use `gemini`, use made-up data only, because free tiers may use prompts to improve their products. All tests use a fake model, so they need no keys and no network.
 
 ---
 
-## 8. Relational Data Model (9 Core Entities)
+## The safety filter
+
+Before any text reaches the AI helper, it passes two checks:
+
+```mermaid
+flowchart LR
+    A["Task messages<br/>last 20, max 4000 characters"] --> B{"Check 1: patterns"}
+    B -->|"PAN, Aadhaar, amounts, bank number, email or phone found"| C["Drop the text<br/>raise ticket to T2"]
+    B -->|"clean"| D{"Check 2: TF-IDF similarity"}
+    D -->|"very sensitive"| C
+    D -->|"sensitive"| E["Leave the text out"]
+    D -->|"not relevant"| E
+    D -->|"clean and relevant"| F["Allowed into the AI context"]
+```
+
+- **Check 1, patterns** (`safety/detectors.py`): rupee amounts, PAN, 12-digit Aadhaar-like numbers, bank account numbers, emails and phone numbers. A match drops the text and raises the ticket to T2. In a handoff note, a match rejects the note with `422`.
+- **Check 2, TF-IDF** (`safety/sensitivity.py`): each sentence is compared with example phrases about salary, grievances, discipline, health, legal and banking topics. TF-IDF is a classic way to turn text into numbers, and it needs no training data. Sentences that look sensitive, or unrelated to the request, are left out.
+
+The thresholds are tuned on a small test set (`tests/data/filter_eval.json`) so that at least 95% of the sensitive sentences are caught. This filter lowers risk. It is not a guarantee (see Limitations).
+
+---
+
+## Data model
 
 ```mermaid
 erDiagram
-    departments ||--o{ users : "employs"
-    departments ||--o{ tickets : "owns queue"
-    departments ||--o{ tasks : "owns queue"
+    departments ||--o{ users : "has"
+    departments ||--o{ tickets : "owns queue of"
+    departments ||--o{ tasks : "owns queue of"
     users ||--o{ tickets : "requests"
-    users ||--o{ tickets : "assigned to"
-    users ||--o{ tasks : "assigned to"
-    tickets ||--o{ tasks : "fans out into"
+    tickets ||--o{ tasks : "splits into"
     tickets ||--o{ public_updates : "has"
-    tickets ||--o{ ticket_events : "records"
-    tasks ||--o{ messages : "contains"
-    tasks ||--o{ shared_contexts : "originates (from_task)"
-    tasks ||--o{ shared_contexts : "targets (to_task)"
-    users ||--o{ shared_contexts : "approves"
-    audit_log }|..|| users : "audits (actor_id)"
+    tickets ||--o{ ticket_events : "logs"
+    tasks ||--o{ messages : "holds"
+    tasks ||--o{ shared_contexts : "shares from"
+    tasks ||--o{ shared_contexts : "shares to"
+    users ||--o{ audit_log : "performs"
 ```
 
-### Database Entities Summary
-
-| Table | Primary Purpose | Security & Privacy Scope |
+| Table | What it stores | Who can see it |
 |---|---|---|
-| `departments` | 6 business units (`HR`, `FIN`, `IT`, `CRM`, `TAG`, `TRIAGE`). | Public metadata. |
-| `users` | User directory with roles: `requester`, `engineer`, `lead`, `manager`. | Authentication identity. |
-| `tickets` | Master incident records with status, priority, tier, and audience. | Public updates visible to requester; details restricted to owner department. |
-| `tasks` | Department-owned units of work fanned out from a parent ticket. | Strictly private to the owning department. |
-| `messages` | Collaborative conversation logs between engineers inside a task. | Isolated to task's department members (404 to all others). |
-| `public_updates` | Curated status updates authored by parent ticket assignees. | Visible to the original requester and department engineers. |
-| `shared_contexts` | Cryptographic contracts governing cross-department handoffs. | Accessible only by source/target departments under valid hash & approval. |
-| `ticket_events` | Machine-readable lifecycle events (timestamps, transitions). | Opaque metadata events (contain no raw message text). |
-| `audit_log` | Immutable append-only audit trail for compliance and security review. | System-wide, unmodifiable audit ledger. |
+| `departments` | HR, FIN, IT, CRM, TAG and TRIAGE | Everyone |
+| `users` | People and their roles | Used to identify the caller |
+| `tickets` | The parent request: status, priority, level, audience | Requester sees the public part. The owning department sees the rest. |
+| `tasks` | One unit of work per department | The owning department only |
+| `messages` | Private discussion inside a task | The task's department only |
+| `public_updates` | Status notes written by a human for the requester | Requester and the owning department |
+| `shared_contexts` | Handoffs: fields, hash, approval, expiry | Source and target departments, under the rules above |
+| `ticket_events` | Lifecycle events such as "assigned" or "escalated" (no message text) | Owning department |
+| `audit_log` | Every allowed or denied call. Insert-only | Reviewers |
 
 ---
 
-## 9. Comprehensive API Reference (Endpoints E1 – E16)
+## API
 
-Authentication is provided via the `X-User-Id` request header (validated against seeded users).
+Send the header `X-User-Id` with a seeded user's ID on every request. This is a prototype shortcut, not real login. The Swagger page at `/docs` lets you try every endpoint.
 
-### Ticket Management
+| ID | Endpoint | Who | What it does |
+|---|---|---|---|
+| E1 | `POST /tickets` | Requester | Create and route a ticket. Restricted categories become T3. |
+| E2 | `GET /tickets/{id}` | Requester or owning department | Requester gets the public view. Engineers get the full view. |
+| E3 | `POST /tickets/{id}/updates` | Ticket owner or assignee | Post a public update. |
+| E4 | `POST /tickets/{id}/close` | Ticket owner or lead | Close the ticket. Fails while any child task is open. |
+| E16 | `POST /tickets/{id}/tier` | Engineer (raise), manager (raise or lower) | Change the confidentiality level. Lowering is logged. |
+| E5 | `GET /tasks/{id}` | Task's department | View a task. |
+| E6 | `POST /tasks/{id}/messages` | Task's department | Add a private message. |
+| E7 | `GET /tasks/{id}/messages` | Task's department | Read private messages. |
+| E14 | `POST /tasks/{id}/complete` | Task assignee | Mark the task done. |
+| E8 | `POST /tasks/{id}/handoff/suggest` | Task assignee | Ask the AI helper for a draft. |
+| E9 | `POST /tasks/{id}/handoff` | Task assignee | Submit a handoff. Creates the child task. |
+| E10 | `POST /handoffs/{id}/approve` | Source department manager | Approve a pending handoff. |
+| E11 | `POST /handoffs/{id}/reject` | Source department manager | Reject a pending handoff. |
+| E12 | `POST /handoffs/{id}/revoke` | Source department manager | Stop all future reads of an approved handoff. |
+| E13 | `GET /handoffs/{id}` | Target department | Read the shared fields, with all checks. |
+| E15 | `POST /admin/sweep` | Manager | Run the overdue-ticket check now. |
 
-| ID | Method & Route | Authorized Actors | Description | Response Codes |
-|---|---|---|---|---|
-| **E1** | `POST /tickets` | `requester` | Creates and routes a parent ticket. Determines department ownership, assigns least-loaded engineer or queues as `AWAITING_ASSIGNMENT`. Forces `T3` on restricted categories. | `201 Created`<br/>`401 Unauthorized`<br/>`422 Unprocessable` |
-| **E2** | `GET /tickets/{id}` | `requester`, Owner Dept | Returns ticket details. Requesters receive a public view (status and public updates). Department engineers receive full parent metadata. | `200 OK`<br/>`401 Unauthorized`<br/>`404 Not Found` |
-| **E3** | `POST /tickets/{id}/updates` | Ticket Owner / Assignee | Posts a human-authored, requester-visible status update. | `201 Created`<br/>`401 Unauthorized`<br/>`404 Not Found` |
-| **E4** | `POST /tickets/{id}/close` | Ticket Owner / Lead | Marks parent ticket `CLOSED`. Fails if any child tasks remain incomplete. | `200 OK`<br/>`400 Bad Request`<br/>`404 Not Found` |
-| **E16** | `POST /tickets/{id}/tier` | Engineer (raise), Manager (raise/lower) | Mutates confidentiality tier (`T1`, `T2`, `T3`). Lowering requires manager role and writes an audit event. | `200 OK`<br/>`403 Forbidden`<br/>`404 Not Found` |
-
-### Department Workspace & Task Isolation
-
-| ID | Method & Route | Authorized Actors | Description | Response Codes |
-|---|---|---|---|---|
-| **E5** | `GET /tasks/{id}` | Task Dept Members | Retrieves department-private task details. | `200 OK`<br/>`401 Unauthorized`<br/>`404 Not Found` |
-| **E6** | `POST /tasks/{id}/messages` | Task Dept Members | Appends an internal, department-isolated message to the task log. | `201 Created`<br/>`401 Unauthorized`<br/>`404 Not Found` |
-| **E7** | `GET /tasks/{id}/messages` | Task Dept Members | Reads the private message history of the department task. | `200 OK`<br/>`401 Unauthorized`<br/>`404 Not Found` |
-| **E14** | `POST /tasks/{id}/complete` | Task Assignee | Transitions task to `DONE`. Allows optional final internal summary message. | `200 OK`<br/>`401 Unauthorized`<br/>`404 Not Found` |
-
-### Secure Handoffs & Approvals
-
-| ID | Method & Route | Authorized Actors | Description | Response Codes |
-|---|---|---|---|---|
-| **E8** | `POST /tasks/{id}/handoff/suggest` | Task Assignee | Triggers LangGraph agent to suggest structured handoff fields. Deterministic fail-closed behavior on T2/T3. | `200 OK`<br/>`401 Unauthorized`<br/>`404 Not Found` |
-| **E9** | `POST /tasks/{id}/handoff` | Task Assignee | Initiates handoff. Validates whitelist schemas, checks audience, binds SHA-256 payload hash, and spawns child task. | `201 Created`<br/>`401 Unauthorized`<br/>`422 Unprocessable` |
-| **E10** | `POST /handoffs/{id}/approve` | Source Dept Manager | Approves pending handoff. Verifies payload hash before signing with `approved_by`. | `200 OK`<br/>`401 Unauthorized`<br/>`404 Not Found` |
-| **E11** | `POST /handoffs/{id}/reject` | Source Dept Manager | Rejects pending handoff request. | `200 OK`<br/>`401 Unauthorized`<br/>`404 Not Found` |
-| **E12** | `POST /handoffs/{id}/revoke` | Source Dept Manager | Revokes an approved handoff, cutting off future reads immediately. | `200 OK`<br/>`401 Unauthorized`<br/>`404 Not Found` |
-| **E13** | `GET /handoffs/{id}` | Target Dept Members | Reads shared context payload by reference. Strictly checks approval, non-expiry, non-revocation, audience, and SHA-256 integrity. | `200 OK`<br/>`401 Unauthorized`<br/>`404 Not Found` |
-
-### System Administration & SLAs
-
-| ID | Method & Route | Authorized Actors | Description | Response Codes |
-|---|---|---|---|---|
-| **E15** | `POST /admin/sweep` | Department Manager | Triggers manual SLA evaluation and escalation sweep. Evaluates assignment deadlines and task SLAs. | `200 OK`<br/>`401 Unauthorized`<br/>`403 Forbidden` |
+Typical responses: `200` or `201` on success, `401` for a missing or unknown user, `404` when you may not see the item, `422` for invalid input.
 
 ---
 
-## 10. Repository Organization
+## Project structure
 
-```
-novintix/
-├── app/
-│   ├── main.py               # FastAPI application setup, lifecycle hooks, router registry
-│   ├── config.py             # Routing rules, SLA intervals, request types, escalation chain
-│   ├── db.py                 # SQLite engine, WAL configuration, Base declarative model
-│   ├── models.py             # 9 SQLAlchemy relational database entities
-│   ├── seed.py               # Database seeder (6 departments, ~10 role-based users)
-│   ├── api/
-│   │   ├── admin.py          # Admin sweep and system health endpoints (E15)
-│   │   ├── handoffs.py       # Cross-department handoffs & approval endpoints (E8-E13)
-│   │   ├── tasks.py          # Department-private task & messaging endpoints (E5-E7, E14)
-│   │   └── tickets.py        # Master ticket lifecycle and public update endpoints (E1-E4, E16)
-│   ├── services/
-│   │   ├── audit.py          # Immutable append-only audit logging service
-│   │   ├── assignment.py     # Least-loaded engineer allocation algorithm
-│   │   ├── authz.py          # Deterministic role, department, and audience authorization
-│   │   ├── handoff.py        # Payload hashing, validation, and child task creation
-│   │   ├── routing.py        # Deterministic ticket category-to-department router
-│   │   └── sweep.py          # SLA breach detector and hierarchical escalation runner
-│   ├── safety/
-│   │   ├── detectors.py      # Deterministic regex detectors (PAN, Aadhaar, INR, Banking)
-│   │   ├── sensitivity.py    # TF-IDF sentence-level sensitivity and relevance filter
-│   │   ├── seeds.py          # Domain seed phrases for TF-IDF cosine comparison
-│   │   └── tiers.py          # Confidentiality tier transition rules and validation
-│   └── agent/
-│       ├── graph.py          # LangGraph state machine definition
-│       ├── llm.py            # LLM provider factory (none, fake, ollama, gemini)
-│       └── schemas.py        # Pydantic schemas for closed-set agent output
-├── tests/
-│   ├── conftest.py           # In-memory SQLite per test, as_user() client, FakeLLM fixture
-│   ├── test_smoke.py         # App boot and OpenAPI schema smoke tests
-│   ├── test_authz.py         # RBAC, boundary enforcement, and 404 enumeration checks
-│   ├── test_tickets.py       # Ticket creation, routing, and assignment test suite
-│   ├── test_handoff.py       # Cryptographic handoff, tampering, and approval tests
-│   ├── test_safety_filter.py # TF-IDF sensitivity and regex detection evaluations
-│   ├── test_agent_graph.py   # LangGraph execution paths and closed-set enforcement
-│   └── test_route_coverage.py# Verification that 100% of registered routes are tested
-├── .agent/state/
-│   └── PHASE_STATE.json      # Structured state tracker for phased milestone execution
-├── SKILL.md                  # Comprehensive architectural specification and phase gate rubric
-├── requirements.txt          # Pinned production and test dependencies
-└── README.md                 # System documentation and operational reference manual
+```text
+app/
+  main.py          App setup
+  config.py        Routing table, request types, deadlines, escalation chain
+  db.py            SQLite connection
+  models.py        The 9 database tables
+  seed.py          Demo departments and users
+  api/             The endpoints (tickets, tasks, handoffs, admin)
+  services/        Business rules: routing, assignment, permissions, handoff, overdue check, audit
+  safety/          Pattern detectors, TF-IDF filter, confidentiality levels
+  agent/           The AI helper: workflow, model provider, output schema
+tests/             One test file per area, plus a check that every endpoint is tested
+SKILL.md           Build specification used with the coding agent
+requirements.txt   Python dependencies
 ```
 
 ---
 
-## 11. Getting Started & Local Development
+## Run it locally
 
-### Prerequisites
-- Python 3.11+
-- Virtual environment tool (`venv`)
-- WSL2 (recommended on Windows environments)
+You need Python 3.11 or newer. On Windows, WSL2 works well.
 
-### Installation
-
-1. **Clone the repository and set up a virtual environment**:
-   ```bash
-   git clone https://github.com/organization/novintix.git
-   cd novintix
-   python3 -m venv .venv
-   source .venv/bin/activate    # On Windows: .venv\Scripts\activate
-   ```
-
-2. **Install dependencies**:
-   ```bash
-   pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
-
-3. **Configure environment variables**:
-   ```bash
-   # Supported LLM providers: "none" (default), "ollama" (local), or "gemini" (free key)
-   export LLM_PROVIDER="none"
-   ```
-
-4. **Launch the development server**:
-   ```bash
-   uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-   ```
-
-5. **Access the interactive documentation**:
-   - Swagger UI: `http://localhost:8000/docs`
-   - ReDoc: `http://localhost:8000/redoc`
-
----
-
-## 12. Verification & Testing
-
-The platform enforces strict zero-network test isolation. Each test executes against an isolated in-memory SQLite database populated with fresh seed fixtures.
-
-### Execute Test Suites
 ```bash
-# Run complete test suite in quiet mode
-pytest -q
+git clone https://github.com/<your-username>/novintix.git
+cd novintix
+python3 -m venv .venv
+source .venv/bin/activate        # Windows PowerShell: .venv\Scripts\activate
+pip install -r requirements.txt
 
-# Run tests with test coverage reporting (Enforces minimum 85% coverage gate)
-pytest --cov=app --cov-report=term-missing --cov-fail-under=85
-
-# Execute safety filter recall validation on benchmark dataset
-pytest tests/test_safety_filter.py -v
+export LLM_PROVIDER=none         # none (default), ollama or gemini
+uvicorn app.main:app --reload --port 8000
 ```
 
-### Route Coverage Verification
-Every HTTP endpoint defined in the system must be covered by functional integration tests. Run the automated route auditor:
+Open `http://localhost:8000/docs` to try the API. The seeded users and their IDs are defined in `app/seed.py`.
+
+## Run the tests
+
 ```bash
-pytest tests/test_route_coverage.py -v
+pytest -q                                              # all tests
+pytest --cov=app --cov-report=term-missing --cov-fail-under=85   # with coverage, must reach 85%
+pytest tests/test_safety_filter.py -v                  # safety filter recall check
+pytest tests/test_route_coverage.py -v                 # fails if any endpoint was never tested
 ```
 
----
-
-## 13. End-to-End Operational Walkthrough
-
-A representative cross-department scenario demonstrating confidentiality isolation, handoff integrity, and public status updates:
-
-1. **Ticket Ingestion (Confidential HR & TAG scope)**:
-   A candidate filing an inquiry via HRMS triggers `POST /tickets` with category `HIRING_QUERY`, `confidential=True`, and `audience_depts=["HR", "TAG"]`.
-   - *Outcome*: Ticket assigned to least-loaded HR engineer. Tier set to `T2 Confidential`.
-
-2. **Isolated Investigation in HR Workspace**:
-   HR engineer logs private notes regarding candidate salary negotiations via `POST /tasks/{id}/messages`.
-   - *Outcome*: Messages are strictly isolated. Inquiries from IT, Finance, or Requester return `404 Not Found`.
-
-3. **Handoff Suggestion & Submission**:
-   HR engineer requests an AI draft via `POST /tasks/{id}/handoff/suggest`.
-   - *Outcome*: Because ticket is `T2`, the agent deterministically aborts LLM invocation and returns a safe fallback.
-   - Engineer manually structures the handoff via `POST /tasks/{id}/handoff` (`request_type="hiring_status_check"`, target `TAG`, `job_req_id="REQ-40120"`, `candidate_ref="CAND-009812"`). Status is set to `PENDING`.
-
-4. **Manager Approval & Cryptographic Hash**:
-   HR Manager executes `POST /handoffs/{id}/approve`.
-   - *Outcome*: Canonical SHA-256 hash computed over payload. Handoff marked `APPROVED`. Downstream task created in TAG queue.
-
-5. **Target Department Reference Consumption**:
-   TAG engineer calls `GET /handoffs/{id}`.
-   - *Outcome*: Engine validates that `TAG` is present in `audience_depts`, verifies non-revocation, and confirms that the SHA-256 payload matches the database record. TAG reads fields without accessing HR's private workspace.
-
-6. **Resolution & Synchronized Parent Closure**:
-   TAG completes child task via `POST /tasks/{id}/complete`. HR engineer publishes an external update via `POST /tickets/{id}/updates` ("Verification completed. Offer confirmed.") and closes the ticket via `POST /tickets/{id}/close`.
-   - *Outcome*: Requester sees only the final public update and `CLOSED` status. Zero internal dialogue was ever exposed.
+Each test uses a fresh in-memory database. No test uses the network.
 
 ---
 
-## 14. Phased Engineering Gates & Cut Hierarchy
+## Example: a confidential hiring question
 
-The platform is developed following a time-boxed, phased gate discipline:
+1. An employee files a ticket from the HR system, marks it confidential, and sets the audience to HR and TAG. The router sends it to HR. The least busy HR engineer gets it. The ticket is T2.
+2. The HR engineer writes private notes in the HR task. Finance, IT and the requester all get `404` if they try to read them.
+3. The engineer asks for an AI draft. Because the ticket is T2, no AI call is made and a safe fallback is returned. The engineer fills in the handoff by hand: type `hiring_status_check`, `job_req_id` REQ-40120, `candidate_ref` CAND-009812.
+4. The handoff is `PENDING` and a child task appears in TAG with a fixed title. TAG cannot read the fields yet. A handoff to Finance would be blocked, because Finance is not in the audience.
+5. The HR manager approves. The hash is checked and the handoff becomes `APPROVED`.
+6. The TAG engineer reads the fields with `GET /handoffs/{id}`. The system re-checks approval, expiry, audience and hash. TAG sees only those fields, never HR's discussion.
+7. TAG completes its task. The HR engineer posts a public update ("Verification completed.") and closes the ticket.
+8. The requester sees the final update and the status `CLOSED`. No internal discussion was ever exposed.
 
-| Phase | Milestone Description | Hard Exit Gate Criteria |
-|---|---|---|
-| **P0** | Foundation & Skeleton | App boots cleanly, OpenAPI schema generated, smoke tests passing. |
-| **P1** | Core Ticketing & Routing | Ticket creation, deterministic routing, least-loaded assignment, TRIAGE fallback. |
-| **P2** | Workspaces, RBAC & Tiers | Task isolation, 404 enumeration defense, tier escalation/downgrade rules. |
-| **P3** | Cryptographic Handoffs | Whitelist regex validation, SHA-256 tamper verification, manager approval lifecycle. |
-| **P4** | Workflow Rules & Sweeper | Parent-child closure locking, 60s idempotent SLA sweeper and escalation chain. |
-| **P5** | Safety Filter & LangGraph | Sensitive chunk recall $\ge 0.95$, closed-set agent output, fail-closed T2/T3 boundaries. |
-| **P6** | Hardening & Coverage | Minimum 85% test coverage, 100% route coverage verification, zero test network calls. |
+---
 
-### Architectural Cut Order (Under Time Constraints)
-If implementation deadlines require feature concessions, components must be deferred in the following strict order without compromising security:
-1. Real-provider LLM wiring beyond `none` and the fake test fixture (preserve factory interface).
-2. LangGraph internal retry loops (preserve deterministic validation and fallback exit).
-3. Handoff revocation endpoint `E12` (preserve expiration TTL).
-4. Task-level escalation in sweeper (preserve assignment SLA evaluation).
-5. Domain relevance scoring in TF-IDF filter (preserve regex detectors and sensitivity filters).
+## Limitations
 
-> **Non-Negotiable Core**: Authorization logic, whitelist schema regex validation, SHA-256 hash verification, tier and audience enforcement, closed-set agent outputs, and test coverage gates are never cut.
+This is a prototype, built to show the design.
 
+- **No real login.** The `X-User-Id` header stands in for single sign-on.
+- **No real integrations.** Nothing connects to a real HR or finance system. Field values come from the engineer or from pattern matching.
+- **No encryption.** Data sits in SQLite as plain text. The hash detects changes but does not hide anything.
+- **The filter can miss things.** The TF-IDF check can miss rephrased sensitive text and text in other languages. The test set is small.
+- **AI tests use a fake model.** They prove the guardrails work, not that the real model's suggestions are good.
+- **Audience is fixed at creation.** There is no flow for widening it later.
+- **Revoking is forward-looking.** It stops future reads but cannot undo what someone already saw.
+- **No attachments, email or live notifications.**
+
+---
+
+## Glossary
+
+| Term | Meaning |
+|---|---|
+| Parent ticket | The original request. One per issue. |
+| Task (child task) | A department's piece of work on a parent ticket. |
+| Queue | The department's pool of unassigned work. A ticket always has a queue, even with no engineer. |
+| Handoff | The controlled way to share a few approved fields with another department. |
+| Audience | The departments allowed to be involved in a confidential ticket. |
+| Tier | The confidentiality level: T1, T2 or T3. |
+| Hash | A fingerprint of some data. If the data changes, the fingerprint changes. |
+| By reference | The other department reads the live record each time instead of getting a copy. |
+| TF-IDF | A simple method that scores how much a sentence resembles example phrases. |
+| LangGraph | A library for building step-by-step AI workflows with clear limits. |
+| Fallback | The safe answer returned when the AI is blocked, fails or is turned off. |
